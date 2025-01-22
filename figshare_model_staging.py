@@ -2,20 +2,20 @@ import modal
 
 iris_image = (
     modal.Image.from_registry("python:3.11-bullseye")
-    .apt_install("git", "git-lfs")
+    .apt_install("wget")
     .pip_install("scikit-learn==1.2.2", "pandas==2.1.2")
-    .run_commands("git clone https://huggingface.co/willengler-uc/iris-classifier")
+    .run_commands("wget -O model.joblib https://figshare.com/ndownloader/files/51847034")
 )
 
-app = modal.App("iris-example-git")
+app = modal.App("iris-example-figshare")
 
 @app.function(image=iris_image)
 def predict_iris_type(input_array):
     import pandas as pd
     import joblib
-
+    
     # Load the model into memory.
-    model = joblib.load(f"/iris-classifier/model.joblib")
+    model = joblib.load(f"/model.joblib")
 
     # Run the model on the user-provided input.
     input_as_df = pd.DataFrame(input_array, columns = ['sepal_length', 'sepal_width', 'petal_length', 'petal_width']) 
