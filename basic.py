@@ -7,7 +7,7 @@ custom_image = (
 
 app = modal.App("hello-garden")
 
-@app.function()
+@app.function(image=custom_image)
 def say_hello():
     import numpy as np
     print(np.__version__)

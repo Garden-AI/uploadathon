@@ -6,7 +6,7 @@ custom_image = (
 
 app = modal.App("hello-modal")
 
-@app.function()
+@app.function(image=custom_image)
 def say_something():
     message = # oops, I forgot to write a message
     return message
