@@ -22,7 +22,7 @@ glamour_image = (
     .pip_install('grakel==0.1.8')
 )
 
-app = modal.App("glamour-app-oof")
+app = modal.App("glamour-app")
 
 @app.function(image=glamour_image)
 def proof_of_concept():
