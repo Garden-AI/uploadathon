@@ -16,6 +16,10 @@ gemma_image = (
 
 app = modal.App("txgemma-garden")
 
+with gemma_image.imports():
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
 @app.cls(
     image=gemma_image, 
     volumes={MODEL_DIR: volume},
@@ -23,14 +27,12 @@ app = modal.App("txgemma-garden")
     enable_memory_snapshot=True
 )
 class TxGemmaPredictor:
-    MODEL_VARIANT = "2b-predict"
     model_id = "google/txgemma-2b-predict"
     
     @modal.enter(snap=True)
     def load_model_to_cpu(self):
-        import torch
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        
+        """Load model weights to CPU memory only during snapshot creation"""
+
         # Load tokenizer
         model_path = MODEL_DIR / self.model_id
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -38,53 +40,106 @@ class TxGemmaPredictor:
             local_files_only=True
         )
         
-        # Store only the configuration and model identifier during snapshot
-        # We'll avoid loading the full model weights in this phase
-        self.model_path = model_path
-        self.config = {"device_map": "auto", "torch_dtype": torch.float16}
-        
-        # Load a minimal placeholder model for the snapshot
-        # This avoids device transition issues later
-        print("Preparing model configuration for snapshot...")
-        
-        # We're not actually loading the full model, just setting up for later
-        # This prevents the device mismatch issues with KV cache
-    
-    @modal.enter(snap=False)
-    def load_model_to_gpu(self):
-        import torch
-        from transformers import AutoModelForCausalLM
-        
-        # Load the model directly with proper GPU configuration after snapshot
-        print("Loading model to GPU after snapshot restoration...")
+        # Load full model to CPU memory during snapshot
+        print("Loading model to CPU for snapshot...")
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            device_map="auto",  # Let transformers handle device mapping
-            torch_dtype=torch.float16,  # Use half precision for GPU
+            model_path,
+            device_map="cpu",  # Force CPU loading
             local_files_only=True
         )
-        print("Model loaded to GPU after snapshot restoration")
+        print("Model loaded to CPU for snapshot")
+    
+    @modal.enter(snap=False)
+    def setup_gpu(self):
+        """Move model to GPU after snapshot restoration"""
+        
+        print("Moving model to GPU after snapshot restoration...")
+        # Simply transfer the entire model to GPU
+        self.model = self.model.to("cuda")
+        print("Model moved to GPU after snapshot restoration")
     
     @modal.method()
     def predict(self, prompt: str):
-        import torch
-        
-        # Set eval mode
+        """Generate predictions with the model"""        
+
+        # Ensure model is in eval mode
         self.model.eval()
         
-        # Tokenize input and ensure it's on the correct device
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        # Process inputs
+        inputs = self.tokenizer(prompt, return_tensors="pt").to("cuda")
         
+        # Disable KV cache to avoid device mismatch issues
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=8,
-                use_cache=True,
+                use_cache=False,  # Disable KV cache to avoid device issues
                 do_sample=False
             )
         
-        response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        return response
+        # Return the decoded output
+        return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+@app.cls(
+    image=gemma_image, 
+    volumes={MODEL_DIR: volume},
+    gpu="T4",
+    enable_memory_snapshot=True
+)
+class TxGemma9b:
+    MODEL_VARIANT = "2b-predict"
+    model_id = "google/txgemma-2b-predict"
+    
+    @modal.enter(snap=True)
+    def load_model_to_cpu(self):
+        """Load model weights to CPU memory only during snapshot creation"""
+
+        # Load tokenizer
+        model_path = MODEL_DIR / self.model_id
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=True
+        )
+        
+        # Load full model to CPU memory during snapshot
+        print("Loading model to CPU for snapshot...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map="cpu",  # Force CPU loading
+            local_files_only=True
+        )
+        print("Model loaded to CPU for snapshot")
+    
+    @modal.enter(snap=False)
+    def setup_gpu(self):
+        """Move model to GPU after snapshot restoration"""
+        
+        print("Moving model to GPU after snapshot restoration...")
+        # Simply transfer the entire model to GPU
+        self.model = self.model.to("cuda")
+        print("Model moved to GPU after snapshot restoration")
+    
+    @modal.method()
+    def predict(self, prompt: str):
+        """Generate predictions with the model"""        
+
+        # Ensure model is in eval mode
+        self.model.eval()
+        
+        # Process inputs
+        inputs = self.tokenizer(prompt, return_tensors="pt").to("cuda")
+        
+        # Disable KV cache to avoid device mismatch issues
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=8,
+                use_cache=False,  # Disable KV cache to avoid device issues
+                do_sample=False
+            )
+        
+        # Return the decoded output
+        return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
 @app.function(
     volumes={MODEL_DIR: volume},
@@ -96,7 +151,7 @@ def download_model(
     ):
     # (keep your existing download_model function)
     import os
-    token = # token here
+    token = # insert token ... 
     os.environ["HF_TOKEN"] = token
     from huggingface_hub import snapshot_download
     from transformers import AutoTokenizer
@@ -119,8 +174,6 @@ Question: Given a drug SMILES string, predict whether it
 (A) does not cross the BBB (B) crosses the BBB
 Drug SMILES: CN1C(=O)CN=C(C2=CCCCC2)c2cc(Cl)ccc21
 """
-    # print(download_model.remote())
-    
-    # Use the class-based approach for prediction
-    # predictor = TxGemmaPredictor()
-    print(TxGemmaPredictor().predict.remote(prompt))
+    print(download_model.remote("google/txgemma-9b-predict"))
+    print(download_model.remote("google/txgemma-9b-chat"))
+    # print(TxGemmaPredictor().predict.remote(prompt))
