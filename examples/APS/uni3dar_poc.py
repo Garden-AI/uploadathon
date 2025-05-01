@@ -18,24 +18,6 @@ def cache_model_weights():
     
     print(f"Model weights downloaded to: {model_path}")
     return model_path
-
-def setup_uni3dar():
-    """Clone the Uni-3DAR repository and set it up"""
-    import os
-    import subprocess
-    import sys
-    
-    # Clone the Uni-3DAR repository
-    subprocess.run(["git", "clone", "https://github.com/dptech-corp/Uni-3DAR.git", "/uni3dar"], check=True)
-    
-    # Add to Python path
-    if "/uni3dar" not in sys.path:
-        sys.path.append("/uni3dar")
-        
-    # Create an empty __init__.py file if it doesn't exist
-    if not os.path.exists("/uni3dar/uni3dar/__init__.py"):
-        with open("/uni3dar/uni3dar/__init__.py", "w") as f:
-            pass
     
 
 aps_image = (
@@ -59,8 +41,8 @@ aps_image = (
     .apt_install("git", "git-lfs")
     .run_commands("pip install git+https://github.com/dptech-corp/Uni-Core.git")
     .run_function(cache_model_weights)
-    .run_function(setup_uni3dar)
-    .pip_install("scikit-learn")
+    .run_commands("git clone https://github.com/dptech-corp/Uni-3DAR.git /uni3dar")
+    .pip_install("scikit-learn")    
 )
 
 app = modal.App("aps-garden")
@@ -135,7 +117,7 @@ def proof_of_concept(cif_as_string):
 
 DEFAULT_CFG: Dict[str, Any] = {
     # high‑level definition
-    # "user_dir": "/uni3dar",
+    # "user_dir": "/uni3dar", # I manually import uni3dar to make sure it's in the tasks registry
     "task": "uni3dar",
     "task_name": "uni3dar_pxrd",
     "loss": "ar",
