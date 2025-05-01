@@ -67,11 +67,6 @@ app = modal.App("aps-garden")
 
 @app.function(image=aps_image, gpu="T4", timeout=1500)
 def proof_of_concept(cif_as_string):
-    
-    # test_cif_path = "./experimental_xrd/wn6225Isup2.rtv.combined.cif"
-
-    # Take the cif_as_string and convert it to a file path that can be read by read_experimental_cif
-    # Create a temporary directory
     import tempfile
     import numpy as np
     import os
@@ -273,6 +268,52 @@ def load_model(
     return model, args
 
 
+def sample_from_model(
+    model,
+    args,
+    cur_data: Dict[str, Any],
+    *,
+    num_samples: int = 1,
+    atom_constraint = None,
+) -> Tuple[List, List[float]]:
+    """
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The sampler returned by `load_model`.
+    args : argparse.Namespace
+        Same object returned by `load_model`; only used to know the
+        key‑names (`atom_type_key`, `lattice_matrix_key`, …) if you need them.
+    cur_data : dict
+        A single datapoint formatted exactly as Uni‑3DAR expects
+        (same fields that used to be read from LMDB).
+    num_samples : int, default 1
+        How many structures to return.
+    atom_constraint : np.ndarray, optional
+        List of Z numbers - 1. e.g., [25,25,25,12,12,7,7,7,7,7] for Fe3Al2O5
+        Leave `None` for unconstrained sampling.
+
+    Returns
+    -------
+    crystals : list[ase.Atoms]
+        List of generated structures (length == `num_samples`).
+    scores   : list[float]
+        The internal model score for each returned structure.
+    """
+    if atom_constraint is not None:
+        assert atom_constraint.ndim == 1, "Provide a flat 1D array."
+
+    crystals, scores = [], []
+    while len(crystals) < num_samples:
+        c, s = model.generate(data=cur_data, atom_constraint=atom_constraint)
+        print(c, s)
+        print("NUMBER OF CRYSTALS RETURNED IS ", len(c))
+        crystals.extend(c)
+        scores.extend(s)
+    crystals, scores = crystals[:num_samples], scores[:num_samples]
+
+    return crystals, scores
+
 @app.local_entrypoint()
 def main():
     # cif_path = "https://raw.githubusercontent.com/gabeguo/cdvae_xrd/main/data/experimental_xrd/cif_files/av5088sup4.rtv.combined.cif"
@@ -282,64 +323,9 @@ def main():
         cif_str = response.read().decode('utf-8')
     print(proof_of_concept.remote(cif_str))
 
-
-
-
-    # TODO: can I get a copy of this?
-    # Pull one of these down:https://github.com/gabeguo/cdvae_xrd/tree/main/data/experimental_xrd/cif_files
-    # test_cif_path = "./experimental_xrd/wn6225Isup2.rtv.combined.cif"
-    # (
-    #     source_file_name,
-    #     cif_str,
-    #     pretty_formula,
-    #     frac_coords,
-    #     atom_Zs,
-    #     spacegroup_number,
-    #     two_theta_vals,
-    #     q_vals,
-    #     i_vals,
-    #     exp_wavelength,
-    #     exp_2theta_min,
-    #     exp_2theta_max,
-    # ) = read_experimental_cif(
-    #     filepath=test_cif_path,
-    # )
-
-    # # Normalize intensity array between 0 and 100
-    # intensity_array = 100 * i_vals / np.max(i_vals)
-    # intensity_array[intensity_array < 0] = 0.0
-
-    # # Filter data to keep only values between 15 and 120 degrees
-    # mask = (two_theta_vals >= 15) & (two_theta_vals <= 120)
-    # two_theta_vals = two_theta_vals[mask]
-    # intensity_array = intensity_array[mask]
-    # atom_type = list(set([Element.from_Z(z).symbol for z in atom_Zs]))
-    # inference_data = {
-    #     "pxrd_x": two_theta_vals,
-    #     "pxrd_y": intensity_array,
-    #     "atom_type": atom_type,
-    # }
-    # atom_constraint = None  # np.array(atom_Zs) - 1
-
-    # model, args = load_model("mp20_pxrd.pt", device="cuda")
-    # crystals, scores = sample_from_model(
-    #     model, args, inference_data, atom_constraint=atom_constraint, num_samples=3
-    # )
-    # print(crystals)
-    # print(scores)
-
-
-# CIF parsing
-# import os
-# import numpy as np
-# import matplotlib.pyplot as plt
-# import pickle
-# import gzip
-
-# from pymatgen.io.cif import CifParser, CifWriter
-# from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-# from pymatgen.analysis.diffraction.xrd import WAVELENGTHS
-
+##################################################
+## Below is code to parse the cif file
+##################################################
 
 default_rad_type = "CuKa"
 default_min_2theta = 5.0
@@ -701,74 +687,5 @@ def read_experimental_cif(filepath, plot=False, save_pickle=False, pickle_path=N
     return result_tuple
 
 
-# We need to install unicore from GH
-# https://github.com/dptech-corp/Uni-Core
 
-# PXRD Inference script for Uni‑3DAR (https://github.com/dptech-corp/Uni-3DAR)
-# Checkpoint: https://huggingface.co/dptech/Uni-3DAR/tree/main
-# Example experimental PXRD cif file: https://github.com/gabeguo/cdvae_xrd/tree/main/data/experimental_xrd
-# 1. Clone the Uni-3DAR repo, create a conda environment using the uni3dar_env.yml file
-# 2. Obtain the ckpt.pt file place it in the top level of the Uni-3DAR repo
-# 3. Download the experimental PXRD cif file or use your own
-# 4. Copy the uni3dar_inference.py into the top level of the Uni-3DAR repo
-# 5. Run the script
-# Inspired by https://github.com/dptech-corp/Uni-3DAR/blob/main/uni3dar/inference.py
-# Curated by: Xiangyu Yin (xiangyu-yin.com)
-
-# from __future__ import annotations
-# import warnings
-
-
-# import numpy as np
-# import torch
-# from unicore import tasks, utils, options
-# from pymatgen.core.periodic_table import Element
-# from parse_cifs import read_experimental_cif
-
-
-def sample_from_model(
-    model,
-    args,
-    cur_data: Dict[str, Any],
-    *,
-    num_samples: int = 1,
-    atom_constraint = None,
-) -> Tuple[List, List[float]]:
-    """
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The sampler returned by `load_model`.
-    args : argparse.Namespace
-        Same object returned by `load_model`; only used to know the
-        key‑names (`atom_type_key`, `lattice_matrix_key`, …) if you need them.
-    cur_data : dict
-        A single datapoint formatted exactly as Uni‑3DAR expects
-        (same fields that used to be read from LMDB).
-    num_samples : int, default 1
-        How many structures to return.
-    atom_constraint : np.ndarray, optional
-        List of Z numbers - 1. e.g., [25,25,25,12,12,7,7,7,7,7] for Fe3Al2O5
-        Leave `None` for unconstrained sampling.
-
-    Returns
-    -------
-    crystals : list[ase.Atoms]
-        List of generated structures (length == `num_samples`).
-    scores   : list[float]
-        The internal model score for each returned structure.
-    """
-    if atom_constraint is not None:
-        assert atom_constraint.ndim == 1, "Provide a flat 1D array."
-
-    crystals, scores = [], []
-    while len(crystals) < num_samples:
-        c, s = model.generate(data=cur_data, atom_constraint=atom_constraint)
-        print(c, s)
-        print("NUMBER OF CRYSTALS RETURNED IS ", len(c))
-        crystals.extend(c)
-        scores.extend(s)
-    crystals, scores = crystals[:num_samples], scores[:num_samples]
-
-    return crystals, scores
     
