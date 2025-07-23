@@ -31,6 +31,13 @@ FAIRCHEM_WEIGHTS_VOLUME = modal.Volume.from_name(
 # The default path used by fairchem
 FAIRCHEM_CACHE_PATH = "/root/.cache/fairchem"
 
+MATTERSIM_WEIGHTS_VOLUME = modal.Volume.from_name(
+    "mattersim-weights", create_if_missing=True
+)
+# The default path used by MatterSim
+MATTERSIM_CACHE_PATH = "/root/.local/mattersim/pretrained_models"
+
+
 GPU_CHOICE = "T4"
 
 FAIRCHEM_IMAGE = (
@@ -464,6 +471,48 @@ class FAIRCHEM:
             optimizer_str="fire",
         )
 
+@app.cls(
+    image=UNIFIED_BASE_IMAGE,
+    # Mount the volume to the MatterSim cache directory
+    volumes={MATTERSIM_CACHE_PATH: MATTERSIM_WEIGHTS_VOLUME},
+    gpu=GPU_CHOICE,
+)
+class MATTERSIM:
+    @modal.enter()
+    def initialize_calculator(self):
+        """Initialize the MatterSim model using the torch-sim wrapper."""
+        import torch
+        from mattersim.forcefield.potential import Potential
+        # Import the official torch-sim wrapper
+        from torch_sim.models.mattersim import MatterSimModel
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        print("Initializing MatterSim model (will download if not cached)...")
+        # Load the pretrained Potential object. This handles the download.
+        potential = Potential.from_checkpoint(device=str(self.device))
+        print("MatterSim model loaded.")
+
+        # Pass the loaded potential into the official torch-sim wrapper
+        self.mattersim_model = MatterSimModel(model=potential)
+        print("torch-sim MatterSimModel wrapper initialized.")
+
+        # Commit the volume to save weights after the first download
+        print("Committing volume to save weights...")
+        MATTERSIM_WEIGHTS_VOLUME.commit()
+        print("Initialization complete.")
+
+    @modal.method()
+    def relax(self, xyz_file_contents: str) -> str:
+        """Relax materials using the MatterSim model."""
+        # MatterSim models use float32 and do not compute stress
+        return _perform_batch_relaxation(
+            xyz_file_contents,
+            self.mattersim_model,
+            self.device,
+            optimizer_str="fire",
+            dtype="float32"
+        )
 
 @app.local_entrypoint()
 def main():
@@ -502,4 +551,4 @@ Cu       3.58000000       5.37000000       5.37000000
 Cu       5.37000000       3.58000000       5.37000000
 Cu       5.37000000       5.37000000       3.58000000
 '''
-    print(FAIRCHEM().relax.remote(sample_file_contents))
+    print(MATTERSIM().relax.remote(sample_file_contents))
