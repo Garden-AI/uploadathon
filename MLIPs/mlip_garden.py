@@ -490,7 +490,10 @@ class MATTERSIM:
 
         print("Initializing MatterSim model (will download if not cached)...")
         # Load the pretrained Potential object. This handles the download.
-        potential = Potential.from_checkpoint(device=str(self.device))
+        potential = Potential.from_checkpoint(
+            load_path="mattersim-v1.0.0-5m", 
+            device=str(self.device)
+        )
         print("MatterSim model loaded.")
 
         # Pass the loaded potential into the official torch-sim wrapper
