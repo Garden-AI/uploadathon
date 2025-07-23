@@ -25,7 +25,37 @@ ORB_WEIGHTS_VOLUME = modal.Volume.from_name(
 # The default path used by the 'cached-path' library
 ORB_CACHE_PATH = "/root/.cache/cached_path"
 
+FAIRCHEM_WEIGHTS_VOLUME = modal.Volume.from_name(
+    "fairchem-weights", create_if_missing=True
+)
+# The default path used by fairchem
+FAIRCHEM_CACHE_PATH = "/root/.cache/fairchem"
+
 GPU_CHOICE = "T4"
+
+FAIRCHEM_IMAGE = (
+    modal.Image.debian_slim(python_version="3.11")
+    # --- Step 1: Install base libraries first ---
+    .pip_install(
+        "torch==2.4.0",
+        "numpy<2.3", # Pin numpy for compatibility
+        gpu=GPU_CHOICE,
+    )
+    .apt_install("git")
+    # --- Step 2: Install libraries that depend on torch ---
+    .pip_install(
+        "fairchem-core==1.10.0",
+        "torch-scatter",
+        "torch-sim-atomistic",
+        "ase",
+        "huggingface_hub",
+        gpu=GPU_CHOICE,
+    )
+    .pip_install(
+        "torch-sparse",
+        gpu=GPU_CHOICE,
+    )
+)
 
 MLIP_IMAGE = (
     modal.Image.debian_slim(python_version="3.12")
@@ -81,12 +111,6 @@ UNIFIED_BASE_IMAGE = (
     )
     .apt_install("git")  # Moved git install before pip installs that need it
     .pip_install(
-        # FairChem dependencies
-        "fairchem-core",
-        "huggingface_hub",
-        gpu=GPU_CHOICE,
-    )
-    .pip_install(
         # SevenNet and Orb dependencies
         "sevenn",
         "plotly",  # Required for SevenNet
@@ -103,70 +127,13 @@ UNIFIED_BASE_IMAGE = (
         "pymatviz",
         gpu=GPU_CHOICE,
     )
-    # .env({"HF_HOME": HF_CACHE_DIR})  # Use persistent Modal volume for HF cache
-    .env({"HUGGING_FACE_HUB_TOKEN": "FOO_BAR_BAZ"})  # Set HF token as environment variable
 )
-
-with UNIFIED_BASE_IMAGE.imports():
-    import ase
-    import numpy as np
-    
-    # Import FairChem dependencies
-    try:
-        from fairchem.core import pretrained_mlip, FAIRChemCalculator
-        from ase.optimize import FIRE, LBFGS, BFGS
-        from ase.filters import FrechetCellFilter, ExpCellFilter
-        FAIRCHEM_IMPORTS_AVAILABLE = True
-    except ImportError as e:
-        print(f"FairChem import failed: {e}")
-        FAIRCHEM_IMPORTS_AVAILABLE = False
-
-    # Import SevenNet dependencies
-    try:
-        import sevenn
-        import sevenn._keys as KEY
-        from sevenn.nn.sequential import AtomGraphSequential
-        from sevenn.calculator import SevenNetCalculator
-        from sevenn import util
-        from pymatviz.enums import Key
-        SEVENNET_IMPORTS_AVAILABLE = True
-    except ImportError as e:
-        print(f"SevenNet import failed: {e}")
-        SEVENNET_IMPORTS_AVAILABLE = False
-
-    # # Import Orb dependencies
-    # try:
-    #     from orb_models.forcefield import pretrained
-    #     from orb_models.forcefield.calculator import ORBCalculator
-    #     from ase.geometry import cell_to_cellpar
-    #     from orb_models.forcefield import featurization_utilities as feat_util
-    #     from orb_models.forcefield.atomic_system import SystemConfig
-    #     from orb_models.forcefield.base import AtomGraphs, _map_concat
-    #     from orb_models.forcefield.featurization_utilities import EdgeCreationMethod
-    #     from orb_models.forcefield.graph_regressor import GraphRegressor
-    #     from torch_sim.elastic import voigt_6_to_full_3x3_stress
-    #     from torch_sim.models.interface import ModelInterface
-    #     ORB_IMPORTS_AVAILABLE = True
-    # except ImportError as e:
-    #     print(f"Orb import failed: {e}")
-    #     ORB_IMPORTS_AVAILABLE = False
-
-    # Import MatterSim dependencies
-    try:
-        from mattersim.forcefield.potential import Potential, MatterSimCalculator
-        from mattersim.datasets.utils.convertor import GraphConvertor
-        from mattersim.forcefield.potential import batch_to_dict
-        from torch_geometric.loader.dataloader import Collater
-        MATTERSIM_IMPORTS_AVAILABLE = True
-    except ImportError as e:
-        print(f"MatterSim import failed: {e}")
-        MATTERSIM_IMPORTS_AVAILABLE = False
-
 
 def _perform_batch_relaxation(
     xyz_file_contents: str,
     model,
     device,
+    optimizer_str: str = "frechet_cell_fire",
     dtype: str = "float64"
 ) -> str:
     """
@@ -193,6 +160,18 @@ def _perform_batch_relaxation(
         torch_dtype = torch.float32
     else:
         raise ValueError(f"Unsupported dtype string: {dtype}")
+    
+    # --- Resolve the optimizer string inside the container ---
+    if optimizer_str == "frechet_cell_fire":
+        optimizer_builder = ts.frechet_cell_fire
+        optimize_kwargs = {
+            "convergence_fn": generate_force_convergence_fn(force_tol=0.05)
+        }
+    elif optimizer_str == "fire":
+        optimizer_builder = ts.optimizers.fire
+        optimize_kwargs = {}
+    else:
+        raise ValueError(f"Unsupported optimizer string: {optimizer_str}")
 
     # Extract material IDs (create if not present) and atom counts - matching original pattern
     mat_ids = []
@@ -263,7 +242,7 @@ def _perform_batch_relaxation(
             
             # Run relaxation
             initial_state = ts.initialize_state(batch_atoms, device=device, dtype=torch_dtype)
-            optimizer_builder = ts.frechet_cell_fire
+            # optimizer_builder = optimizer_builder
             optimizer_callable = lambda model, **_kwargs: optimizer_builder(model, md_flavor="ase_fire")
             
             relaxed_state = ts.optimize(
@@ -271,7 +250,7 @@ def _perform_batch_relaxation(
                 model=model,
                 optimizer=optimizer_callable,
                 max_steps=500,
-                convergence_fn=generate_force_convergence_fn(force_tol=0.05),
+                **optimize_kwargs
             )
             
             relaxed_atoms_list = relaxed_state.to_atoms()
@@ -369,7 +348,6 @@ class SEVENNET_MF_OMPA:
     @modal.enter()
     def initialize_calculator(self):
         """Initialize the SevenNet calculator and model on GPU."""
-        # No more symlink logic needed!
         from sevenn.calculator import SevenNetCalculator
         from torch_sim.models.sevennet import SevenNetModel
 
@@ -438,6 +416,54 @@ class MACE:
         """Relax materials using MACE model."""
         return _perform_batch_relaxation(xyz_file_contents, self.mace_model, self.device)
 
+@app.cls(
+    image=FAIRCHEM_IMAGE,
+    # Mount the volume to the default fairchem cache directory
+    volumes={FAIRCHEM_CACHE_PATH: FAIRCHEM_WEIGHTS_VOLUME},
+    gpu=GPU_CHOICE,
+)
+class FAIRCHEM:
+    @modal.enter()
+    def initialize_calculator(self):
+        """
+        Initialize the FairChem model using the v1.10 API and torch-sim wrapper.
+        """
+        import torch
+        # --- Correct import for fairchem-core v1.10 ---
+        from fairchem.core.models.model_registry import model_name_to_local_file
+        from torch_sim.models.fairchem import FairChemModel
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        print("Downloading FairChem checkpoint using v1.10 API...")
+        # Use a model name available in the v1.10 release
+        model_name = "EquiformerV2-31M-S2EF-OC20-All+MD"
+        
+        # This function downloads the model and returns the local path
+        checkpoint_path = model_name_to_local_file(model_name, local_cache=FAIRCHEM_CACHE_PATH)
+        print(f"FairChem model checkpoint ready at: {checkpoint_path}")
+
+        # Pass the checkpoint path directly to the torch-sim wrapper
+        self.fairchem_model = FairChemModel(model=checkpoint_path)
+        print("torch-sim FairChemModel wrapper initialized.")
+
+        # Commit the volume to save weights after the first download
+        print("Committing volume to save weights...")
+        FAIRCHEM_WEIGHTS_VOLUME.commit()
+        print("Initialization complete.")
+
+    @modal.method()
+    def relax(self, xyz_file_contents: str) -> str:
+        """Relax materials using the FairChem model."""
+        # FairChem models use float32
+        return _perform_batch_relaxation(
+            xyz_file_contents,
+            self.fairchem_model,
+            self.device,
+            dtype="float32",
+            optimizer_str="fire",
+        )
+
 
 @app.local_entrypoint()
 def main():
@@ -476,4 +502,4 @@ Cu       3.58000000       5.37000000       5.37000000
 Cu       5.37000000       3.58000000       5.37000000
 Cu       5.37000000       5.37000000       3.58000000
 '''
-    print(MACE().relax.remote(sample_file_contents))
+    print(FAIRCHEM().relax.remote(sample_file_contents))
