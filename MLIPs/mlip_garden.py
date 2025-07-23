@@ -19,7 +19,11 @@ SEVENNET_CACHE_PATH = "/usr/local/lib/python3.11/site-packages/sevenn/pretrained
 
 # SEVENNET_CACHE_PATH = "/root/.cache/sevennet"
 
-
+ORB_WEIGHTS_VOLUME = modal.Volume.from_name(
+    "orb-weights", create_if_missing=True
+)
+# The default path used by the 'cached-path' library
+ORB_CACHE_PATH = "/root/.cache/cached_path"
 
 GPU_CHOICE = "T4"
 
@@ -100,7 +104,7 @@ UNIFIED_BASE_IMAGE = (
         gpu=GPU_CHOICE,
     )
     # .env({"HF_HOME": HF_CACHE_DIR})  # Use persistent Modal volume for HF cache
-    .env({"HUGGING_FACE_HUB_TOKEN": "INSERT_SECRET"})  # Set HF token as environment variable
+    .env({"HUGGING_FACE_HUB_TOKEN": "FOO_BAR_BAZ"})  # Set HF token as environment variable
 )
 
 with UNIFIED_BASE_IMAGE.imports():
@@ -130,22 +134,22 @@ with UNIFIED_BASE_IMAGE.imports():
         print(f"SevenNet import failed: {e}")
         SEVENNET_IMPORTS_AVAILABLE = False
 
-    # Import Orb dependencies
-    try:
-        from orb_models.forcefield import pretrained
-        from orb_models.forcefield.calculator import ORBCalculator
-        from ase.geometry import cell_to_cellpar
-        from orb_models.forcefield import featurization_utilities as feat_util
-        from orb_models.forcefield.atomic_system import SystemConfig
-        from orb_models.forcefield.base import AtomGraphs, _map_concat
-        from orb_models.forcefield.featurization_utilities import EdgeCreationMethod
-        from orb_models.forcefield.graph_regressor import GraphRegressor
-        from torch_sim.elastic import voigt_6_to_full_3x3_stress
-        from torch_sim.models.interface import ModelInterface
-        ORB_IMPORTS_AVAILABLE = True
-    except ImportError as e:
-        print(f"Orb import failed: {e}")
-        ORB_IMPORTS_AVAILABLE = False
+    # # Import Orb dependencies
+    # try:
+    #     from orb_models.forcefield import pretrained
+    #     from orb_models.forcefield.calculator import ORBCalculator
+    #     from ase.geometry import cell_to_cellpar
+    #     from orb_models.forcefield import featurization_utilities as feat_util
+    #     from orb_models.forcefield.atomic_system import SystemConfig
+    #     from orb_models.forcefield.base import AtomGraphs, _map_concat
+    #     from orb_models.forcefield.featurization_utilities import EdgeCreationMethod
+    #     from orb_models.forcefield.graph_regressor import GraphRegressor
+    #     from torch_sim.elastic import voigt_6_to_full_3x3_stress
+    #     from torch_sim.models.interface import ModelInterface
+    #     ORB_IMPORTS_AVAILABLE = True
+    # except ImportError as e:
+    #     print(f"Orb import failed: {e}")
+    #     ORB_IMPORTS_AVAILABLE = False
 
     # Import MatterSim dependencies
     try:
@@ -159,7 +163,12 @@ with UNIFIED_BASE_IMAGE.imports():
         MATTERSIM_IMPORTS_AVAILABLE = False
 
 
-def _perform_batch_relaxation(xyz_file_contents: str, model, device) -> str:
+def _perform_batch_relaxation(
+    xyz_file_contents: str,
+    model,
+    device,
+    dtype: str = "float64"
+) -> str:
     """
     Common helper function to perform batch relaxation using any torch-sim compatible model.
     
@@ -172,10 +181,19 @@ def _perform_batch_relaxation(xyz_file_contents: str, model, device) -> str:
         String content of relaxed structures in XYZ format
     """
     from io import StringIO
+    import torch
     
     string_file = StringIO(xyz_file_contents)
     initial_atoms_list = read(string_file, index=":", format='extxyz')
     
+    # --- Resolve the dtype string inside the container ---
+    if dtype == "float64":
+        torch_dtype = torch.float64
+    elif dtype == "float32":
+        torch_dtype = torch.float32
+    else:
+        raise ValueError(f"Unsupported dtype string: {dtype}")
+
     # Extract material IDs (create if not present) and atom counts - matching original pattern
     mat_ids = []
     for idx, atoms in enumerate(initial_atoms_list):
@@ -244,7 +262,7 @@ def _perform_batch_relaxation(xyz_file_contents: str, model, device) -> str:
             print(f"  - Batch {batch_idx + 1}/{n_batches}: {len(batch_atoms)} materials")
             
             # Run relaxation
-            initial_state = ts.initialize_state(batch_atoms, device=device, dtype=torch.float64)
+            initial_state = ts.initialize_state(batch_atoms, device=device, dtype=torch_dtype)
             optimizer_builder = ts.frechet_cell_fire
             optimizer_callable = lambda model, **_kwargs: optimizer_builder(model, md_flavor="ase_fire")
             
@@ -256,9 +274,20 @@ def _perform_batch_relaxation(xyz_file_contents: str, model, device) -> str:
                 convergence_fn=generate_force_convergence_fn(force_tol=0.05),
             )
             
-            # Collect results
             relaxed_atoms_list = relaxed_state.to_atoms()
-            final_energies = relaxed_state.energy.cpu().tolist()
+            energies_tensor = relaxed_state.energy
+
+            # Ensure energies are always in a list
+            if energies_tensor.dim() == 0:
+                # This is a 0-d tensor, so convert to a list with one item
+                final_energies = [energies_tensor.item()]
+            else:
+                # This is a 1-d or higher tensor, tolist() works correctly
+                final_energies = energies_tensor.cpu().tolist()
+
+            # Also ensure the atoms list is always a list for consistency
+            if not isinstance(relaxed_atoms_list, list):
+                relaxed_atoms_list = [relaxed_atoms_list]
             
             batch_results = [
                 {
@@ -298,6 +327,38 @@ def _perform_batch_relaxation(xyz_file_contents: str, model, device) -> str:
     print(f"\n✅ Relaxation complete! Returning XYZ content for {len(relaxed_atoms_list)} structures")
     return xyz_content
 
+@app.cls(
+    image=UNIFIED_BASE_IMAGE,
+    volumes={ORB_CACHE_PATH: ORB_WEIGHTS_VOLUME},
+    gpu=GPU_CHOICE,
+)
+class ORB:
+    @modal.enter()
+    def initialize_calculator(self):
+        """Initialize the ORB model for float32 execution."""
+        import torch
+        from orb_models.forcefield import pretrained
+        from torch_sim.models.orb import OrbModel
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        print("Initializing ORB model (using float32)...")
+        orb_ff = pretrained.orb_v3_conservative_inf_omat(
+            device=self.device,
+            precision="float32-high",
+            compile=False
+        )
+
+        self.orb_model = OrbModel(model=orb_ff, device=self.device)
+
+        print("Committing volume to save weights...")
+        ORB_WEIGHTS_VOLUME.commit()
+        print("Initialization complete.")
+
+    @modal.method()
+    def relax(self, xyz_file_contents: str) -> str:
+        """Relax materials using the ORB model."""
+        return _perform_batch_relaxation(xyz_file_contents, self.orb_model, self.device, dtype="float32")
 
 @app.cls(
     image=UNIFIED_BASE_IMAGE,
@@ -415,4 +476,4 @@ Cu       3.58000000       5.37000000       5.37000000
 Cu       5.37000000       3.58000000       5.37000000
 Cu       5.37000000       5.37000000       3.58000000
 '''
-    print(SEVENNET_MF_OMPA().relax.remote(sample_file_contents))
+    print(MACE().relax.remote(sample_file_contents))
