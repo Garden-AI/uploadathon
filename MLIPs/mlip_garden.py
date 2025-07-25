@@ -408,7 +408,7 @@ class MACE:
         print("Pre-loading MACE model...")
         # Get the raw model directly, bypassing the ASE Calculator wrapper
         raw_model = mace_mp(
-            model="medium",
+            model="medium-mpa-0",
             device=self.device,
             enable_cueq=True,
             default_dtype="float64",
@@ -444,7 +444,7 @@ class FAIRCHEM:
 
         print("Downloading FairChem checkpoint using v1.10 API...")
         # Use a model name available in the v1.10 release
-        model_name = "EquiformerV2-31M-S2EF-OC20-All+MD"
+        model_name = "EquiformerV2-83M-S2EF-OC20-2M"
         
         # This function downloads the model and returns the local path
         checkpoint_path = model_name_to_local_file(model_name, local_cache=FAIRCHEM_CACHE_PATH)
@@ -554,4 +554,4 @@ Cu       3.58000000       5.37000000       5.37000000
 Cu       5.37000000       3.58000000       5.37000000
 Cu       5.37000000       5.37000000       3.58000000
 '''
-    print(MATTERSIM().relax.remote(sample_file_contents))
+    print(FAIRCHEM().relax.remote(sample_file_contents))
