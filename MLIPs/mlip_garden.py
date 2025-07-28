@@ -17,8 +17,6 @@ SEVENNET_WEIGHTS_VOLUME = modal.Volume.from_name(
 )
 SEVENNET_CACHE_PATH = "/usr/local/lib/python3.11/site-packages/sevenn/pretrained_potentials/SevenNet_MF_ompa"
 
-# SEVENNET_CACHE_PATH = "/root/.cache/sevennet"
-
 ORB_WEIGHTS_VOLUME = modal.Volume.from_name(
     "orb-weights", create_if_missing=True
 )
@@ -37,6 +35,11 @@ MATTERSIM_WEIGHTS_VOLUME = modal.Volume.from_name(
 # The default path used by MatterSim
 MATTERSIM_CACHE_PATH = "/root/.local/mattersim/pretrained_models"
 
+# Matbench Discovery data
+BENCHMARK_CACHE_DIR = "/root/.cache/matbench-discovery"
+BENCHMARK_VOLUME = modal.Volume.from_name(
+    "matbench-discovery-data", create_if_missing=True
+)
 
 GPU_CHOICE = "T4"
 
@@ -62,6 +65,10 @@ FAIRCHEM_IMAGE = (
         "torch-sparse",
         gpu=GPU_CHOICE,
     )
+    .pip_install(
+        "matbench-discovery @ git+https://github.com/janosh/matbench-discovery.git@d6bd5f5",
+        "plotly"
+    )
 )
 
 MLIP_IMAGE = (
@@ -84,7 +91,17 @@ MLIP_IMAGE = (
         gpu=GPU_CHOICE,
     )
     # Install the remaining packages
-    .pip_install("ase")
+    .pip_install(
+        "ase",
+        "pymatgen",
+        "pandas",
+        "numpy",
+        "pyarrow",  # Good practice to include with pandas for parquet support
+    )
+    .pip_install(
+        "matbench-discovery @ git+https://github.com/janosh/matbench-discovery.git@d6bd5f5",
+        "plotly"
+    )
 )
 
 with MLIP_IMAGE.imports():
@@ -133,6 +150,10 @@ UNIFIED_BASE_IMAGE = (
         # Common utilities
         "pymatviz",
         gpu=GPU_CHOICE,
+    )
+    .pip_install(
+        "matbench-discovery @ git+https://github.com/janosh/matbench-discovery.git@d6bd5f5",
+        "plotly"
     )
 )
 
@@ -185,7 +206,6 @@ def _perform_batch_relaxation(
     for idx, atoms in enumerate(initial_atoms_list):
         if 'material_id' in atoms.info:
             mat_ids.append(atoms.info['material_id'])
-            print(atoms.info['material_id'])
         else:
             mat_id = f"material_{idx}"
             atoms.info['material_id'] = mat_id
@@ -315,7 +335,10 @@ def _perform_batch_relaxation(
 
 @app.cls(
     image=UNIFIED_BASE_IMAGE,
-    volumes={ORB_CACHE_PATH: ORB_WEIGHTS_VOLUME},
+    volumes={
+        ORB_CACHE_PATH: ORB_WEIGHTS_VOLUME,
+        BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME
+    },
     gpu=GPU_CHOICE,
 )
 class ORB:
@@ -342,13 +365,36 @@ class ORB:
         print("Initialization complete.")
 
     @modal.method()
+    def benchmark(self, n_samples: int = 2500) -> dict:
+        """Runs a cost and accuracy benchmark for the model."""
+        import time
+        # 1. Get benchmark data
+        benchmark_xyz, ground_truth = _get_benchmark_data(n_samples)
+
+        # 2. Run relaxation and time it
+        start_time = time.perf_counter()
+        
+        relaxed_xyz = _perform_batch_relaxation(benchmark_xyz, self.orb_model, self.device, dtype="float32")
+        
+        end_time = time.perf_counter()
+        wall_time = end_time - start_time
+
+        # 3. Score and return results
+        return _score_benchmark(
+            self.__class__.__name__, relaxed_xyz, ground_truth, wall_time, n_samples
+        )
+
+    @modal.method()
     def relax(self, xyz_file_contents: str) -> str:
         """Relax materials using the ORB model."""
         return _perform_batch_relaxation(xyz_file_contents, self.orb_model, self.device, dtype="float32")
 
 @app.cls(
     image=UNIFIED_BASE_IMAGE,
-    volumes={SEVENNET_CACHE_PATH: SEVENNET_WEIGHTS_VOLUME},
+    volumes={
+        SEVENNET_CACHE_PATH: SEVENNET_WEIGHTS_VOLUME,
+        BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME    
+    },
     gpu=GPU_CHOICE
 )
 class SEVENNET_MF_OMPA:
@@ -382,15 +428,38 @@ class SEVENNET_MF_OMPA:
         print("Initialization complete.")
 
     @modal.method()
+    def benchmark(self, n_samples: int = 2500) -> dict:
+        """Runs a cost and accuracy benchmark for the model."""
+        import time
+        # 1. Get benchmark data
+        benchmark_xyz, ground_truth = _get_benchmark_data(n_samples)
+
+        # 2. Run relaxation and time it
+        start_time = time.perf_counter()
+        
+        relaxed_xyz = _perform_batch_relaxation(benchmark_xyz, self.sevennet_model, self.device)
+        
+        end_time = time.perf_counter()
+        wall_time = end_time - start_time
+
+        # 3. Score and return results
+        return _score_benchmark(
+            self.__class__.__name__, relaxed_xyz, ground_truth, wall_time, n_samples
+        )
+
+    @modal.method()
     def relax(self, xyz_file_contents: str) -> str:
         """Relax materials using SevenNet model."""
         return _perform_batch_relaxation(xyz_file_contents, self.sevennet_model, self.device)
 
 @app.cls(
     image=MLIP_IMAGE,
-    volumes={WEIGHTS_CACHE_DIR: WEIGHTS_VOLUME},
+    volumes={
+        WEIGHTS_CACHE_DIR: WEIGHTS_VOLUME,
+        BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME    
+    },
     gpu=GPU_CHOICE,
-    timeout=1800, # 30 minute timeout
+    timeout=3600, # 30 minute timeout
     max_containers=3
 )
 class MACE:
@@ -419,6 +488,27 @@ class MACE:
         WEIGHTS_VOLUME.commit()
 
     @modal.method()
+    def benchmark(self, n_samples: int = 2500) -> dict:
+        """Runs a cost and accuracy benchmark for the model."""
+        import time
+
+        # 1. Get benchmark data
+        benchmark_xyz, ground_truth = _get_benchmark_data(n_samples)
+
+        # 2. Run relaxation and time it
+        start_time = time.perf_counter()
+        
+        relaxed_xyz = _perform_batch_relaxation(benchmark_xyz, self.mace_model, self.device)
+        
+        end_time = time.perf_counter()
+        wall_time = end_time - start_time
+
+        # 3. Score and return results
+        return _score_benchmark(
+            self.__class__.__name__, relaxed_xyz, ground_truth, wall_time, n_samples
+        )
+
+    @modal.method()
     def relax(self, xyz_file_contents: str) -> str:
         """Relax materials using MACE model."""
         return _perform_batch_relaxation(xyz_file_contents, self.mace_model, self.device)
@@ -426,7 +516,10 @@ class MACE:
 @app.cls(
     image=FAIRCHEM_IMAGE,
     # Mount the volume to the default fairchem cache directory
-    volumes={FAIRCHEM_CACHE_PATH: FAIRCHEM_WEIGHTS_VOLUME},
+    volumes={
+        FAIRCHEM_CACHE_PATH: FAIRCHEM_WEIGHTS_VOLUME,
+        BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME
+    },
     gpu=GPU_CHOICE,
 )
 class FAIRCHEM:
@@ -460,6 +553,32 @@ class FAIRCHEM:
         print("Initialization complete.")
 
     @modal.method()
+    def benchmark(self, n_samples: int = 2500) -> dict:
+        """Runs a cost and accuracy benchmark for the model."""
+        import time
+        # 1. Get benchmark data
+        benchmark_xyz, ground_truth = _get_benchmark_data(n_samples)
+
+        # 2. Run relaxation and time it
+        start_time = time.perf_counter()
+        
+        relaxed_xyz = _perform_batch_relaxation(
+            benchmark_xyz,
+            self.fairchem_model,
+            self.device,
+            dtype="float32",
+            optimizer_str="fire",
+        )
+        
+        end_time = time.perf_counter()
+        wall_time = end_time - start_time
+
+        # 3. Score and return results
+        return _score_benchmark(
+            self.__class__.__name__, relaxed_xyz, ground_truth, wall_time, n_samples
+        )
+
+    @modal.method()
     def relax(self, xyz_file_contents: str) -> str:
         """Relax materials using the FairChem model."""
         # FairChem models use float32
@@ -474,7 +593,10 @@ class FAIRCHEM:
 @app.cls(
     image=UNIFIED_BASE_IMAGE,
     # Mount the volume to the MatterSim cache directory
-    volumes={MATTERSIM_CACHE_PATH: MATTERSIM_WEIGHTS_VOLUME},
+    volumes={
+        MATTERSIM_CACHE_PATH: MATTERSIM_WEIGHTS_VOLUME, 
+        BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME
+    },
     gpu=GPU_CHOICE,
 )
 class MATTERSIM:
@@ -504,6 +626,32 @@ class MATTERSIM:
         print("Committing volume to save weights...")
         MATTERSIM_WEIGHTS_VOLUME.commit()
         print("Initialization complete.")
+    
+    @modal.method()
+    def benchmark(self, n_samples: int = 2500) -> dict:
+        """Runs a cost and accuracy benchmark for the model."""
+        import time
+        # 1. Get benchmark data
+        benchmark_xyz, ground_truth = _get_benchmark_data(n_samples)
+
+        # 2. Run relaxation and time it
+        start_time = time.perf_counter()
+        
+        relaxed_xyz = _perform_batch_relaxation(
+            benchmark_xyz,
+            self.mattersim_model,
+            self.device,
+            optimizer_str="fire",
+            dtype="float32"
+        )
+        
+        end_time = time.perf_counter()
+        wall_time = end_time - start_time
+
+        # 3. Score and return results
+        return _score_benchmark(
+            self.__class__.__name__, relaxed_xyz, ground_truth, wall_time, n_samples
+        )
 
     @modal.method()
     def relax(self, xyz_file_contents: str) -> str:
@@ -516,6 +664,185 @@ class MATTERSIM:
             optimizer_str="fire",
             dtype="float32"
         )
+
+@app.function(
+    image=(
+        modal.Image.debian_slim(python_version="3.12")
+        .apt_install("git")
+        .pip_install(
+            "matbench-discovery @ git+https://github.com/janosh/matbench-discovery.git@d6bd5f5",
+            "pandas",
+            "pyarrow",
+            "scikit-learn",
+            "plotly", # Add plotly, it's a dependency for matbench-discovery plotting
+        )
+    ),
+    volumes={BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME},
+    timeout=600,
+)
+def cache_matbench_subset(
+    n_samples: int = 2500, random_seed: int = 42, force: bool = False
+):
+    """
+    Creates and caches a randomly sampled subset of the Matbench WBM dataset,
+    saving only the structures to a single XYZ file.
+    """
+    from matbench_discovery.data import DataFiles, ase_atoms_from_zip
+    from pathlib import Path
+    import random
+    from ase.io import write
+
+    structures_path = Path(BENCHMARK_CACHE_DIR) / f"wbm_subset_{n_samples}_structures.xyz"
+
+    if structures_path.exists() and not force:
+        print(f"✅ Benchmark structures already cached at {structures_path}. Skipping.")
+        BENCHMARK_VOLUME.read_only_relayout()
+        return
+
+    print("📜 Downloading and loading initial atoms from matbench-discovery...")
+    atoms_list = ase_atoms_from_zip(DataFiles.wbm_initial_atoms.path)
+    
+    print(f"🎲 Sampling {n_samples} structures with seed {random_seed}...")
+    random.seed(random_seed)
+    sampled_atoms = random.sample(atoms_list, n_samples)
+    
+    print(f"💾 Caching {n_samples} structures to {structures_path}...")
+    write(structures_path, sampled_atoms, format="extxyz")
+
+    BENCHMARK_VOLUME.commit()
+    print("✅ Caching complete.")
+
+def _get_benchmark_data(n_samples: int = 2500) -> tuple[str, dict]:
+    """
+    Loads cached benchmark structures from the full 2500-structure XYZ file
+    and fetches their ground truth energies from df_wbm at runtime. If n_samples
+    is provided, it returns the first n structures from the file.
+    """
+    from pathlib import Path
+    from ase.io import read, write
+    from io import StringIO
+    from pymatviz.enums import Key
+    from matbench_discovery.data import df_wbm
+    from matbench_discovery.enums import MbdKey
+
+    # --- CHANGE 1: Always point to the full benchmark file ---
+    full_benchmark_size = 2500
+    structures_path = Path(BENCHMARK_CACHE_DIR) / f"wbm_subset_{full_benchmark_size}_structures.xyz"
+
+    if not structures_path.exists():
+        raise FileNotFoundError(
+            f"Cached benchmark structures not found at {structures_path}. "
+            f"Please run 'modal run mlip_garden.py::cache_matbench_subset --n-samples {full_benchmark_size}' first."
+        )
+
+    # Read all Atoms objects from the canonical file
+    full_atoms_list = read(structures_path, index=":")
+    
+    # --- CHANGE 2: Select a subset if n_samples is smaller ---
+    if n_samples < len(full_atoms_list):
+        atoms_list = full_atoms_list[:n_samples]
+    else:
+        atoms_list = full_atoms_list
+    
+    # --- CHANGE 3: Generate the corresponding XYZ content for the subset ---
+    string_buffer = StringIO()
+    write(string_buffer, atoms_list, format='extxyz')
+    xyz_contents = string_buffer.getvalue()
+    
+    # Get material IDs from the (potentially smaller) list of structures
+    mat_ids = [atoms.info[Key.mat_id] for atoms in atoms_list]
+
+    # Fetch ground truth energies on demand
+    ground_truth_e_form = df_wbm.loc[mat_ids, MbdKey.e_form_dft].to_dict()
+
+    return xyz_contents, ground_truth_e_form
+
+def _score_benchmark(
+    model_class_name: str,
+    relaxed_xyz: str,
+    ground_truth: dict,
+    wall_time: float,
+    n_samples: int,
+) -> dict:
+    """
+    Scores the results of a benchmark run, calculating MAE and F1 score.
+    This version includes the essential patch for the matbench-discovery
+    UnicodeDecodeError and does not calculate RMSD or CPS.
+    """
+    import yaml
+    original_yaml_load = yaml.load
+
+    # Define a new, robust load function
+    def patched_yaml_load(stream, Loader):
+        # The stream can be a string, a byte string, or a file object.
+        # The error only happens when it's a file object opened with the wrong encoding.
+        # We check if the stream has a 'name' attribute, which file objects do.
+        if hasattr(stream, 'name'):
+            # Re-open the file stream with the correct encoding
+            with open(stream.name, 'r', encoding='utf-8') as f:
+                return original_yaml_load(f, Loader)
+        # If it's not a file object (e.g., a string), load it normally
+        return original_yaml_load(stream, Loader)
+
+    yaml.load = patched_yaml_load
+
+    from io import StringIO
+    from ase.io import read
+    from pymatgen.io.ase import AseAtomsAdaptor
+    from sklearn.metrics import mean_absolute_error
+    import pandas as pd
+    from matbench_discovery.metrics.discovery import stable_metrics
+    from matbench_discovery.energy import (
+        calc_energy_from_e_refs,
+        mp_elemental_ref_energies,
+    )
+
+    relaxed_atoms_list = read(StringIO(relaxed_xyz), index=":", format="extxyz")
+
+    true_e_form_per_atom = []
+    pred_e_form_per_atom = []
+    material_ids = []
+
+    for atoms in relaxed_atoms_list:
+        mat_id = atoms.info.get("material_id")
+        if mat_id and mat_id in ground_truth:
+            material_ids.append(mat_id)
+            structure = AseAtomsAdaptor.get_structure(atoms)
+            composition = structure.composition
+            e_form = calc_energy_from_e_refs(
+                composition,
+                total_energy=atoms.info["final_energy"],
+                ref_energies=mp_elemental_ref_energies,
+            )
+            pred_e_form_per_atom.append(e_form / len(atoms))
+            true_e_form_per_atom.append(ground_truth[mat_id])
+
+    if not true_e_form_per_atom:
+        print("Warning: No matching ground truth energies found for scoring.")
+        mae, f1_score = float("nan"), float("nan")
+    else:
+        mae = mean_absolute_error(true_e_form_per_atom, pred_e_form_per_atom)
+        s_true = pd.Series(true_e_form_per_atom, index=material_ids)
+        s_pred = pd.Series(pred_e_form_per_atom, index=material_ids)
+        metrics = stable_metrics(
+            each_true=s_true, each_pred=s_pred
+        )
+        f1_score = metrics.get("F1", 0)
+
+    materials_per_second = n_samples / wall_time
+    cost_per_second = 0.000164 + 0.0000131
+    cost_per_1000_materials = (1000 / materials_per_second) * cost_per_second
+
+    return {
+        "model_class": model_class_name,
+        "n_samples": n_samples,
+        "wall_time_seconds": round(wall_time, 2),
+        "materials_per_second": round(materials_per_second, 2),
+        "cost_per_1000_materials_usd": round(cost_per_1000_materials, 4),
+        "mae_e_form_per_atom": round(mae, 4),
+        "f1_score": round(f1_score, 4),
+    }
+
 
 @app.local_entrypoint()
 def main():
@@ -554,4 +881,6 @@ Cu       3.58000000       5.37000000       5.37000000
 Cu       5.37000000       3.58000000       5.37000000
 Cu       5.37000000       5.37000000       3.58000000
 '''
-    print(FAIRCHEM().relax.remote(sample_file_contents))
+    # print(FAIRCHEM().relax.remote(sample_file_contents))
+    # cache_matbench_subset.remote()
+    print(MACE().benchmark.remote())
