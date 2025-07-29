@@ -17,18 +17,6 @@ SEVENNET_WEIGHTS_VOLUME = modal.Volume.from_name(
 )
 SEVENNET_CACHE_PATH = "/usr/local/lib/python3.11/site-packages/sevenn/pretrained_potentials/SevenNet_MF_ompa"
 
-ORB_WEIGHTS_VOLUME = modal.Volume.from_name(
-    "orb-weights", create_if_missing=True
-)
-# The default path used by the 'cached-path' library
-ORB_CACHE_PATH = "/root/.cache/cached_path"
-
-FAIRCHEM_WEIGHTS_VOLUME = modal.Volume.from_name(
-    "fairchem-weights", create_if_missing=True
-)
-# The default path used by fairchem
-FAIRCHEM_CACHE_PATH = "/root/.cache/fairchem"
-
 MATTERSIM_WEIGHTS_VOLUME = modal.Volume.from_name(
     "mattersim-weights", create_if_missing=True
 )
@@ -43,35 +31,9 @@ BENCHMARK_VOLUME = modal.Volume.from_name(
 
 GPU_CHOICE = "T4"
 
-FAIRCHEM_IMAGE = (
-    modal.Image.debian_slim(python_version="3.11")
-    # --- Step 1: Install base libraries first ---
-    .pip_install(
-        "torch==2.4.0",
-        "numpy<2.3", # Pin numpy for compatibility
-        gpu=GPU_CHOICE,
-    )
-    .apt_install("git")
-    # --- Step 2: Install libraries that depend on torch ---
-    .pip_install(
-        "fairchem-core==1.10.0",
-        "torch-scatter",
-        "torch-sim-atomistic",
-        "ase",
-        "huggingface_hub",
-        gpu=GPU_CHOICE,
-    )
-    .pip_install(
-        "torch-sparse",
-        gpu=GPU_CHOICE,
-    )
-    .pip_install(
-        "matbench-discovery @ git+https://github.com/janosh/matbench-discovery.git@d6bd5f5",
-        "plotly"
-    )
-)
+# MACE ENV
 
-MLIP_IMAGE = (
+MACE_IMAGE = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     # Install PyTorch and the CUEQ libraries for GPU acceleration
@@ -96,19 +58,15 @@ MLIP_IMAGE = (
         "pymatgen",
         "pandas",
         "numpy",
-        "pyarrow",  # Good practice to include with pandas for parquet support
+        "pyarrow",
     )
     .pip_install(
+        # Just needed for ad hoc benchmarking
         "matbench-discovery @ git+https://github.com/janosh/matbench-discovery.git@d6bd5f5",
         "plotly"
     )
 )
 
-with MLIP_IMAGE.imports():
-    import torch
-    import torch_sim as ts
-    from ase.io import read, write
-    from torch_sim import generate_force_convergence_fn
 
 ### OTHER MLIPs ENV
 
@@ -135,10 +93,9 @@ UNIFIED_BASE_IMAGE = (
     )
     .apt_install("git")  # Moved git install before pip installs that need it
     .pip_install(
-        # SevenNet and Orb dependencies
+        # SevenNet dependencies
         "sevenn",
         "plotly",  # Required for SevenNet
-        "orb-models[inference]",
         gpu=GPU_CHOICE,
     )
     .pip_install(
@@ -152,6 +109,7 @@ UNIFIED_BASE_IMAGE = (
         gpu=GPU_CHOICE,
     )
     .pip_install(
+        # Just needed for ad hoc benchmarking
         "matbench-discovery @ git+https://github.com/janosh/matbench-discovery.git@d6bd5f5",
         "plotly"
     )
@@ -336,62 +294,6 @@ def _perform_batch_relaxation(
 @app.cls(
     image=UNIFIED_BASE_IMAGE,
     volumes={
-        ORB_CACHE_PATH: ORB_WEIGHTS_VOLUME,
-        BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME
-    },
-    gpu=GPU_CHOICE,
-)
-class ORB:
-    @modal.enter()
-    def initialize_calculator(self):
-        """Initialize the ORB model for float32 execution."""
-        import torch
-        from orb_models.forcefield import pretrained
-        from torch_sim.models.orb import OrbModel
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        print("Initializing ORB model (using float32)...")
-        orb_ff = pretrained.orb_v3_conservative_inf_omat(
-            device=self.device,
-            precision="float32-high",
-            compile=False
-        )
-
-        self.orb_model = OrbModel(model=orb_ff, device=self.device)
-
-        print("Committing volume to save weights...")
-        ORB_WEIGHTS_VOLUME.commit()
-        print("Initialization complete.")
-
-    @modal.method()
-    def benchmark(self, n_samples: int = 2500) -> dict:
-        """Runs a cost and accuracy benchmark for the model."""
-        import time
-        # 1. Get benchmark data
-        benchmark_xyz, ground_truth = _get_benchmark_data(n_samples)
-
-        # 2. Run relaxation and time it
-        start_time = time.perf_counter()
-        
-        relaxed_xyz = _perform_batch_relaxation(benchmark_xyz, self.orb_model, self.device, dtype="float32")
-        
-        end_time = time.perf_counter()
-        wall_time = end_time - start_time
-
-        # 3. Score and return results
-        return _score_benchmark(
-            self.__class__.__name__, relaxed_xyz, ground_truth, wall_time, n_samples
-        )
-
-    @modal.method()
-    def relax(self, xyz_file_contents: str) -> str:
-        """Relax materials using the ORB model."""
-        return _perform_batch_relaxation(xyz_file_contents, self.orb_model, self.device, dtype="float32")
-
-@app.cls(
-    image=UNIFIED_BASE_IMAGE,
-    volumes={
         SEVENNET_CACHE_PATH: SEVENNET_WEIGHTS_VOLUME,
         BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME    
     },
@@ -452,8 +354,14 @@ class SEVENNET_MF_OMPA:
         """Relax materials using SevenNet model."""
         return _perform_batch_relaxation(xyz_file_contents, self.sevennet_model, self.device)
 
+with MACE_IMAGE.imports():
+    import torch
+    import torch_sim as ts
+    from ase.io import read, write
+    from torch_sim import generate_force_convergence_fn
+
 @app.cls(
-    image=MLIP_IMAGE,
+    image=MACE_IMAGE,
     volumes={
         WEIGHTS_CACHE_DIR: WEIGHTS_VOLUME,
         BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME    
@@ -512,83 +420,6 @@ class MACE:
     def relax(self, xyz_file_contents: str) -> str:
         """Relax materials using MACE model."""
         return _perform_batch_relaxation(xyz_file_contents, self.mace_model, self.device)
-
-@app.cls(
-    image=FAIRCHEM_IMAGE,
-    # Mount the volume to the default fairchem cache directory
-    volumes={
-        FAIRCHEM_CACHE_PATH: FAIRCHEM_WEIGHTS_VOLUME,
-        BENCHMARK_CACHE_DIR: BENCHMARK_VOLUME
-    },
-    gpu=GPU_CHOICE,
-)
-class FAIRCHEM:
-    @modal.enter()
-    def initialize_calculator(self):
-        """
-        Initialize the FairChem model using the v1.10 API and torch-sim wrapper.
-        """
-        import torch
-        # --- Correct import for fairchem-core v1.10 ---
-        from fairchem.core.models.model_registry import model_name_to_local_file
-        from torch_sim.models.fairchem import FairChemModel
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        print("Downloading FairChem checkpoint using v1.10 API...")
-        # Use a model name available in the v1.10 release
-        model_name = "EquiformerV2-83M-S2EF-OC20-2M"
-        
-        # This function downloads the model and returns the local path
-        checkpoint_path = model_name_to_local_file(model_name, local_cache=FAIRCHEM_CACHE_PATH)
-        print(f"FairChem model checkpoint ready at: {checkpoint_path}")
-
-        # Pass the checkpoint path directly to the torch-sim wrapper
-        self.fairchem_model = FairChemModel(model=checkpoint_path)
-        print("torch-sim FairChemModel wrapper initialized.")
-
-        # Commit the volume to save weights after the first download
-        print("Committing volume to save weights...")
-        FAIRCHEM_WEIGHTS_VOLUME.commit()
-        print("Initialization complete.")
-
-    @modal.method()
-    def benchmark(self, n_samples: int = 2500) -> dict:
-        """Runs a cost and accuracy benchmark for the model."""
-        import time
-        # 1. Get benchmark data
-        benchmark_xyz, ground_truth = _get_benchmark_data(n_samples)
-
-        # 2. Run relaxation and time it
-        start_time = time.perf_counter()
-        
-        relaxed_xyz = _perform_batch_relaxation(
-            benchmark_xyz,
-            self.fairchem_model,
-            self.device,
-            dtype="float32",
-            optimizer_str="fire",
-        )
-        
-        end_time = time.perf_counter()
-        wall_time = end_time - start_time
-
-        # 3. Score and return results
-        return _score_benchmark(
-            self.__class__.__name__, relaxed_xyz, ground_truth, wall_time, n_samples
-        )
-
-    @modal.method()
-    def relax(self, xyz_file_contents: str) -> str:
-        """Relax materials using the FairChem model."""
-        # FairChem models use float32
-        return _perform_batch_relaxation(
-            xyz_file_contents,
-            self.fairchem_model,
-            self.device,
-            dtype="float32",
-            optimizer_str="fire",
-        )
 
 @app.cls(
     image=UNIFIED_BASE_IMAGE,
@@ -725,7 +556,6 @@ def _get_benchmark_data(n_samples: int = 2500) -> tuple[str, dict]:
     from matbench_discovery.data import df_wbm
     from matbench_discovery.enums import MbdKey
 
-    # --- CHANGE 1: Always point to the full benchmark file ---
     full_benchmark_size = 2500
     structures_path = Path(BENCHMARK_CACHE_DIR) / f"wbm_subset_{full_benchmark_size}_structures.xyz"
 
@@ -738,13 +568,11 @@ def _get_benchmark_data(n_samples: int = 2500) -> tuple[str, dict]:
     # Read all Atoms objects from the canonical file
     full_atoms_list = read(structures_path, index=":")
     
-    # --- CHANGE 2: Select a subset if n_samples is smaller ---
     if n_samples < len(full_atoms_list):
         atoms_list = full_atoms_list[:n_samples]
     else:
         atoms_list = full_atoms_list
     
-    # --- CHANGE 3: Generate the corresponding XYZ content for the subset ---
     string_buffer = StringIO()
     write(string_buffer, atoms_list, format='extxyz')
     xyz_contents = string_buffer.getvalue()
@@ -883,4 +711,6 @@ Cu       5.37000000       5.37000000       3.58000000
 '''
     # print(FAIRCHEM().relax.remote(sample_file_contents))
     # cache_matbench_subset.remote()
-    print(MACE().benchmark.remote())
+    print(MACE().benchmark.remote(n_samples=5))
+    print(MATTERSIM().benchmark.remote(n_samples=5))
+    print(SEVENNET_MF_OMPA().benchmark.remote(n_samples=5))
