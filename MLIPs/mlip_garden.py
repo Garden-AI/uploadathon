@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import modal
 
-### MACE ENV
-
-# --- Basic Modal Setup ---
 app = modal.App("mlip-app")
+
+#
+# VOLUMES
+#
+# Unfortunately, each model sets its weights cache at a specific location we can't override.
+# So we need to mount separate volumes for each model.
 
 WEIGHTS_CACHE_DIR = "/root/.cache/mace"
 WEIGHTS_VOLUME = modal.Volume.from_name(
@@ -30,6 +33,12 @@ BENCHMARK_VOLUME = modal.Volume.from_name(
 )
 
 GPU_CHOICE = "T4"
+
+#
+# Containers
+#
+# MACE has some dependencies that are incompatible with the other models.
+# But Mattersim and 7net can use the same container.
 
 # MACE ENV
 
@@ -68,7 +77,7 @@ MACE_IMAGE = (
 )
 
 
-### OTHER MLIPs ENV
+### MatterSim and 7net ENV
 
 UNIFIED_BASE_IMAGE = (
     modal.Image.debian_slim(python_version="3.11")
@@ -224,7 +233,7 @@ def _perform_batch_relaxation(
             batch_original_indices = [item[0] for item in batch_materials]
             
             print(f"  - Batch {batch_idx + 1}/{n_batches}: {len(batch_atoms)} materials")
-            
+
             # Run relaxation
             initial_state = ts.initialize_state(batch_atoms, device=device, dtype=torch_dtype)
             # optimizer_builder = optimizer_builder
@@ -709,8 +718,8 @@ Cu       3.58000000       5.37000000       5.37000000
 Cu       5.37000000       3.58000000       5.37000000
 Cu       5.37000000       5.37000000       3.58000000
 '''
-    # print(FAIRCHEM().relax.remote(sample_file_contents))
+    print(MACE().relax.remote(sample_file_contents))
     # cache_matbench_subset.remote()
-    print(MACE().benchmark.remote(n_samples=5))
-    print(MATTERSIM().benchmark.remote(n_samples=5))
-    print(SEVENNET_MF_OMPA().benchmark.remote(n_samples=5))
+    # print(MACE().benchmark.remote(n_samples=5))
+    # print(MATTERSIM().benchmark.remote(n_samples=5))
+    # print(SEVENNET_MF_OMPA().benchmark.remote(n_samples=5))
