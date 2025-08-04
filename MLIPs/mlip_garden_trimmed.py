@@ -124,13 +124,100 @@ UNIFIED_BASE_IMAGE = (
     )
 )
 
+def validate_relaxation_params(relax_params: dict | None, frechet_supported: bool = True) -> tuple[dict, str | None]:
+    """
+    Validate and normalize relaxation parameters.
+    
+    Args:
+        relax_params: Dictionary of relaxation parameters from user
+        frechet_supported: Whether frechet_cell_fire optimizer is supported
+        
+    Returns:
+        Tuple of (validated_params, error_message). If error_message is not None,
+        validated_params should be ignored.
+    """
+    if relax_params is None:
+        relax_params = {}
+        
+    # Create a copy to avoid modifying the original
+    validated = {}
+    
+    # Validate optimizer_type
+    optimizer_type = relax_params.get("optimizer_type", "frechet_cell_fire")
+    if optimizer_type not in ["frechet_cell_fire", "fire"]:
+        return {}, f"Invalid optimizer_type '{optimizer_type}'. Must be 'frechet_cell_fire' or 'fire'."
+    
+    if optimizer_type == "frechet_cell_fire" and not frechet_supported:
+        return {}, "The 'frechet_cell_fire' optimizer is not supported in this context. Use 'fire' instead."
+        
+    validated["optimizer_type"] = optimizer_type
+    
+    # Validate md_flavor
+    md_flavor = relax_params.get("md_flavor", "ase_fire")
+    if md_flavor not in ["ase_fire", "vv_fire"]:
+        return {}, f"Invalid md_flavor '{md_flavor}'. Must be 'ase_fire' or 'vv_fire'."
+    validated["md_flavor"] = md_flavor
+    
+    # Validate frechet-specific parameters
+    frechet_only_bool_params = ["hydrostatic_strain", "constant_volume"]
+    frechet_only_float_params = ["scalar_pressure"]
+    
+    # Handle boolean frechet params
+    for param_name in frechet_only_bool_params:
+        if param_name in relax_params:
+            param_value = relax_params[param_name]
+            
+            # If user is using fire but passed frechet-specific params, error
+            if optimizer_type == "fire":
+                return {}, f"Parameter '{param_name}' is only valid for 'frechet_cell_fire' optimizer, but 'fire' optimizer was specified."
+                
+            # Validate boolean type
+            if not isinstance(param_value, bool):
+                return {}, f"Parameter '{param_name}' must be a boolean (True/False), got {type(param_value).__name__}."
+            validated[param_name] = param_value
+        elif optimizer_type == "frechet_cell_fire":
+            # Set defaults for frechet_cell_fire
+            validated[param_name] = False
+    
+    # Handle float frechet params
+    for param_name in frechet_only_float_params:
+        if param_name in relax_params:
+            param_value = relax_params[param_name]
+            
+            # If user is using fire but passed frechet-specific params, error
+            if optimizer_type == "fire":
+                return {}, f"Parameter '{param_name}' is only valid for 'frechet_cell_fire' optimizer, but 'fire' optimizer was specified."
+                
+            # Validate float type (allow int too, will be converted)
+            if not isinstance(param_value, (float, int)):
+                return {}, f"Parameter '{param_name}' must be a number, got {type(param_value).__name__}."
+            validated[param_name] = float(param_value)
+        elif optimizer_type == "frechet_cell_fire":
+            # Set defaults for frechet_cell_fire
+            if param_name == "scalar_pressure":
+                validated[param_name] = 0.0
+    
+    # Copy through other known parameters with their defaults
+    other_params = {
+        "fmax": 0.05,
+        "max_steps": 500,
+    }
+    
+    for param_name, default_value in other_params.items():
+        if param_name in relax_params:
+            validated[param_name] = relax_params[param_name]
+        else:
+            validated[param_name] = default_value
+    
+    return validated, None
+
+
 def _perform_batch_relaxation(
     xyz_file_contents: str,
     model,
     device,
-    optimizer_str: str = "frechet_cell_fire",
+    validated_params: dict,
     dtype: str = "float64",
-    relax_params: dict | None = None,
 ) -> str:
     """
     Common helper function to perform batch relaxation using any torch-sim compatible model.
@@ -139,37 +226,38 @@ def _perform_batch_relaxation(
         xyz_file_contents: String content of XYZ file
         model: The torch-sim model to use for relaxation
         device: The torch device to use
+        validated_params: Pre-validated dictionary of relaxation parameters
+        dtype: Data type to use ("float64" or "float32")
         
     Returns:
         String content of relaxed structures in XYZ format
     """
     from io import StringIO
     import torch
-    
-    if relax_params is None:
-        relax_params = {}
 
-    # --- Resolve the optimizer string inside the container ---
-    if optimizer_str == "frechet_cell_fire":
+    # --- Resolve the optimizer based on validated parameters ---
+    optimizer_type = validated_params["optimizer_type"]
+    if optimizer_type == "frechet_cell_fire":
         optimizer_builder = ts.frechet_cell_fire
         # These parameters are only valid for frechet_cell_fire
         optimizer_kwargs = {
-            "hydrostatic_strain": relax_params.get("hydrostatic_strain", False),
-            "constant_volume": relax_params.get("constant_volume", False),
-            "scalar_pressure": relax_params.get("scalar_pressure", 0.0),
-            "md_flavor": relax_params.get("md_flavor", "ase_fire"),
+            "hydrostatic_strain": validated_params["hydrostatic_strain"],
+            "constant_volume": validated_params["constant_volume"],
+            "scalar_pressure": validated_params["scalar_pressure"],
+            "md_flavor": validated_params["md_flavor"],
         }
         convergence_fn = generate_force_convergence_fn(
-            force_tol=relax_params.get("fmax", 0.05), include_cell_forces=True
+            force_tol=validated_params["fmax"], include_cell_forces=True
         )
-    elif optimizer_str == "fire":
+    elif optimizer_type == "fire":
         optimizer_builder = ts.optimizers.fire
-        optimizer_kwargs = {"md_flavor": relax_params.get("md_flavor", "ase_fire")}
+        optimizer_kwargs = {"md_flavor": validated_params["md_flavor"]}
         convergence_fn = generate_force_convergence_fn(
-            force_tol=relax_params.get("fmax", 0.05), include_cell_forces=False
+            force_tol=validated_params["fmax"], include_cell_forces=False
         )
     else:
-        raise ValueError(f"Unsupported optimizer string: {optimizer_str}")
+        # This should never happen with validated params, but keep for safety
+        raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
     string_file = StringIO(xyz_file_contents)
     initial_atoms_list = read(string_file, index=":", format='extxyz')
@@ -256,7 +344,7 @@ def _perform_batch_relaxation(
                 system=initial_state,
                 model=model,
                 optimizer=optimizer_callable,
-                max_steps=relax_params.get("max_steps", 500),
+                max_steps=validated_params.get("max_steps", 500),
                 convergence_fn=convergence_fn,
             )
             
@@ -481,7 +569,10 @@ class SEVENNET:
     @modal.method()
     def relax(self, xyz_file_contents: str, relax_params: dict | None = None) -> str:
         """Relax materials using SevenNet model."""
-        return _perform_batch_relaxation(xyz_file_contents, self.sevennet_model, self.device, dtype="float32", relax_params=relax_params)
+        validated_params, error_msg = validate_relaxation_params(relax_params, frechet_supported=True)
+        if error_msg:
+            raise ValueError(f"Invalid relaxation parameters: {error_msg}")
+        return _perform_batch_relaxation(xyz_file_contents, self.sevennet_model, self.device, validated_params, dtype="float32")
     
     @modal.method()
     def benchmark(self, n_samples: int = 2500) -> dict:
@@ -493,7 +584,8 @@ class SEVENNET:
         # 2. Run relaxation and time it
         start_time = time.perf_counter()
         
-        relaxed_xyz = _perform_batch_relaxation(benchmark_xyz, self.sevennet_model, self.device)
+        validated_params, _ = validate_relaxation_params(None, frechet_supported=True)
+        relaxed_xyz = _perform_batch_relaxation(benchmark_xyz, self.sevennet_model, self.device, validated_params)
         
         end_time = time.perf_counter()
         wall_time = end_time - start_time
@@ -546,7 +638,10 @@ class MACE:
     @modal.method()
     def relax(self, xyz_file_contents: str, relax_params: dict | None = None) -> str:
         """Relax materials using MACE model."""
-        return _perform_batch_relaxation(xyz_file_contents, self.mace_model, self.device, relax_params=relax_params)
+        validated_params, error_msg = validate_relaxation_params(relax_params, frechet_supported=True)
+        if error_msg:
+            raise ValueError(f"Invalid relaxation parameters: {error_msg}")
+        return _perform_batch_relaxation(xyz_file_contents, self.mace_model, self.device, validated_params)
 
     @modal.method()
     def benchmark(self, n_samples: int = 2500) -> dict:
@@ -559,7 +654,8 @@ class MACE:
         # 2. Run relaxation and time it
         start_time = time.perf_counter()
         
-        relaxed_xyz = _perform_batch_relaxation(benchmark_xyz, self.mace_model, self.device)
+        validated_params, _ = validate_relaxation_params(None, frechet_supported=True)
+        relaxed_xyz = _perform_batch_relaxation(benchmark_xyz, self.mace_model, self.device, validated_params)
         
         end_time = time.perf_counter()
         wall_time = end_time - start_time
@@ -609,13 +705,23 @@ class MATTERSIM:
     def relax(self, xyz_file_contents: str, relax_params: dict | None = None) -> str:
         """Relax materials using the MatterSim model."""
         # MatterSim models use float32 and do not compute stress
+        if relax_params is None:
+            relax_params = {}
+        
+        # Set default optimizer_type to fire if not specified, but don't override user's choice
+        if "optimizer_type" not in relax_params:
+            relax_params = {**relax_params, "optimizer_type": "fire"}
+        
+        validated_params, error_msg = validate_relaxation_params(relax_params, frechet_supported=False)
+        if error_msg:
+            raise ValueError(f"Invalid relaxation parameters: {error_msg}")
+        
         return _perform_batch_relaxation(
             xyz_file_contents,
             self.mattersim_model,
             self.device,
-            optimizer_str="fire",
-            dtype="float32",
-            relax_params=relax_params
+            validated_params,
+            dtype="float32"
         )
 
     @modal.method()
@@ -628,11 +734,12 @@ class MATTERSIM:
         # 2. Run relaxation and time it
         start_time = time.perf_counter()
         
+        validated_params, _ = validate_relaxation_params({"optimizer_type": "fire"}, frechet_supported=False)
         relaxed_xyz = _perform_batch_relaxation(
             benchmark_xyz,
             self.mattersim_model,
             self.device,
-            optimizer_str="fire",
+            validated_params,
             dtype="float32"
         )
         
